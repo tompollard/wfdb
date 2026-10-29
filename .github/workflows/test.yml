@@ -1,0 +1,69 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 24.04 (GCC 13) is used rather than ubuntu-latest, because
+          # GCC 15 rejects the old-style function declarations in some
+          # applications.
+          - name: Ubuntu (libcurl, libFLAC)
+            os: ubuntu-24.04
+            packages: libcurl4-gnutls-dev libflac-dev
+            configure: --with-libcurl --with-flac
+          - name: Ubuntu (no libcurl, no libFLAC)
+            os: ubuntu-24.04
+            packages: ""
+            configure: --without-netfiles --without-flac
+          - name: macOS (libcurl, libFLAC)
+            os: macos-latest
+            packages: flac pkgconf
+            configure: --with-libcurl --with-flac
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux' && matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ${{ matrix.packages }}
+
+      - name: Configure
+        run: ./configure --prefix="$RUNNER_TEMP/wfdb" ${{ matrix.configure }} </dev/null
+
+      - name: Build and install
+        run: make install
+
+      - name: Run tests
+        # Use local copies of the remote test records instead of PhysioNet,
+        # so that the tests don't depend on the network.
+        env:
+          WFDB_NO_NET_CHECK: 1
+        run: make check
+
+      - name: Show test results
+        if: failure()
+        run: |
+          cd checkpkg
+          cat libcheck.out appcheck.out 2>/dev/null || true
+          if [ -f lcheck.log ]; then
+            diff expected/lcheck.log lcheck.log || true
+          fi
