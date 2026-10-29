@@ -1,3 +1,19 @@
+10.7.1 (unreleased):
+	The WFDB library can read and write records stored in archives.  An
+	archive is a ZIP file, named after the record with the extension
+	'.wfdb' (for example, '100.wfdb'), that holds the record's header file,
+	its signal files, and optionally annotation and other files.  To read
+	or write a record in an archive, give the record name with the '.wfdb'
+	extension (for example, 'rdsamp -r 100.wfdb' or 'sqrs -r 100.wfdb').
+	Files written to an archive are added to it when wfdbquit() is called
+	or the program exits; other files already in the archive are kept, and
+	if the archive can't be written, the existing archive is left
+	unchanged.  Files in archives are stored without compression, so that
+	any range of samples can be read efficiently.  Archives on web
+	servers, multi-segment records in archives, and compressed files
+	within archives are not yet supported.  The format is the same as that
+	used by the WFDB Python package.
+
 10.7.0 (10 June 2022):
 	The WFDB library now supports storing signals in compressed form, using
 	the FLAC (Free Lossless Audio Codec) algorithm.  Compressed signal

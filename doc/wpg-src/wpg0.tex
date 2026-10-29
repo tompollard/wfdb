@@ -196,6 +196,27 @@ possible, for example, to create a local disk file of your own
 annotations for a record read from a web server or a CDROM, and to
 treat your file as part of the record.
 
+@cindex archive
+The files of a record can also be kept together in a single
+@dfn{archive}, named after the record with the extension @samp{.wfdb}
+(for example, @file{100.wfdb}).  An archive is a ZIP file that contains
+the record's header file (@file{100.hea}), the signal files named in the
+header, and optionally annotation and other files, all at the top level
+of the archive.  To read or write a record in an archive, give the
+record name with the @samp{.wfdb} extension (for example,
+@samp{rdsamp -r 100.wfdb}).  The archive is found by searching the WFDB
+path, in the same way as other files.  Signal files to be written to an
+archive are named after the archive (for example, a signal file named
+@file{100.wfdb.dat} is stored as @file{100.dat} within @file{100.wfdb}).
+Files written to an archive are added to it when @code{wfdbquit} is
+invoked or the program exits;  other files already in the archive are
+kept.  The archive is first written to a temporary file, so that if an
+error occurs, any existing archive is left unchanged.  Files are stored
+in archives without compression, so that any range of samples can be
+read without reading the rest of the signal file;  compressed files
+within archives cannot be read.  Archives on web servers and
+multi-segment records in archives are not supported.
+
 @node     Concepts 2, Concepts 3, Concepts 1, Overview
 @unnumberedsec Signals, Samples, and Time
 @cindex adu
