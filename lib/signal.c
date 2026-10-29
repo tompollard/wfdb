@@ -210,6 +210,7 @@ void example(void)
 */
 static unsigned maxhsig;	/* # of hsdata structures pointed to by hsd */
 static WFDB_FILE *hheader;	/* file pointer for header file */
+static char *iarchive;		/* archive containing the input record, if any */
 static char *linebuf;		/* temporary buffer for reading header lines */
 static size_t linebufsize;	/* size of linebuf */
 static struct hsdata {
@@ -938,6 +939,7 @@ static int readheader(const char *record)
 	(void)wfdb_fclose(hheader);
 	hheader = NULL;
     }
+    SFREE(iarchive);
 
     spfmax = 1;
     sfreq = ffreq;
@@ -962,7 +964,7 @@ static int readheader(const char *record)
     q = (char *)record + strlen(record) - 1;
     while (q > record && *q != '.' && *q != '/' && *q != ':' && *q != '\\')
 	q--;
-    if (*q == '.') {
+    if (*q == '.' && !wfdb_isarchive(record)) {
 	if ((hheader = wfdb_open(NULL, record, WFDB_READ)) == NULL) {
 	    wfdb_error("init: can't open %s\n", record);
 	    return (-1);
@@ -976,6 +978,10 @@ static int readheader(const char *record)
 	wfdb_error("init: can't open header for record %s\n", record);
 	return (-1);
     }
+
+    /* If the header is in an archive, so are the signal files. */
+    if (wfdb_archive_name(hheader))
+	SSTRCPY(iarchive, wfdb_archive_name(hheader));
 
     /* Read the first line and check for a magic string. */
     if (wfdb_getline(&linebuf, &linebufsize, hheader) == 0) {
@@ -1015,6 +1021,11 @@ static int readheader(const char *record)
 	    wfdb_error(
 	  "init: record %s cannot be nested in another multi-segment record\n",
 		     record);
+	    return (-2);
+	}
+	if (iarchive) {
+	    wfdb_error(
+	      "init: multi-segment records in archives are not supported\n");
 	    return (-2);
 	}
 	segments = strtol(q+1, NULL, 10);
@@ -3097,7 +3108,16 @@ FINT isigopen(char *record, WFDB_Siginfo *siarray, int nsig)
 	/* Check that the signal file is readable. */
 	if (hs->info.fmt == 0)
 	    ig->fp = NULL;	/* Don't open a file for a null signal. */
-	else { 
+	else if (iarchive) {
+	    ig->fp = wfdb_archive_open(iarchive, hs->info.fname);
+	    if (ig->fp == NULL) {
+		wfdb_error("isigopen: can't open %s in archive %s\n",
+			   hs->info.fname, iarchive);
+	        SFREE(ig->buf);
+		continue;
+	    }
+	}
+	else {
 	    ig->fp = wfdb_open(hs->info.fname, (char *)NULL, WFDB_READ);
 	    /* Skip this group if the signal file can't be opened. */
 	    if (ig->fp == NULL) {
@@ -3851,7 +3871,9 @@ FINT newheader(char *record)
 
 FINT setheader(char *record, const WFDB_Siginfo *siarray, unsigned int nsig)
 {
-    char *p;
+    char *p, *archive = NULL, **fname = NULL;
+    const char *rname = record;
+    int rnlen = strlen(record), stat = 0;
     WFDB_Signal s;
 
     /* If another output header file was opened, close it. */
@@ -3868,14 +3890,52 @@ FINT setheader(char *record, const WFDB_Siginfo *siarray, unsigned int nsig)
     if (wfdb_checkname(record, "record"))
 	return (-1);
 
+    /* If the record is in an archive (RECORD.wfdb), its signal files must be
+       in the same archive (as RECORD.wfdb.EXT, stored in the archive as
+       RECORD.EXT);  the header refers to them by their names within the
+       archive. */
+    if (wfdb_isarchive(record)) {
+	SUALLOC(fname, nsig + 1, sizeof(char *));
+	if (fname == NULL)
+	    return (-1);
+	for (s = 0; s < nsig && stat == 0; s++) {
+	    if (siarray[s].fmt == 0 || siarray[s].fname == NULL)
+		continue;
+	    if (!wfdb_archive_split(siarray[s].fname, &archive, &fname[s]) ||
+		strcmp(archive, record) != 0) {
+		wfdb_error("newheader: signal file %s is not in archive %s\n",
+			   siarray[s].fname, record);
+		stat = -1;
+	    }
+	    SFREE(archive);
+	}
+	/* The record name in the header doesn't include the path or the
+	   ".wfdb" extension. */
+	rnlen -= 5;
+	for (p = record + rnlen; p > record; p--)
+	    if (*(p-1) == '/' || *(p-1) == '\\' || *(p-1) == ':')
+		break;
+	rname = p;
+	rnlen -= (p - record);
+    }
+
     /* Try to create the header file. */
-    if ((oheader = wfdb_open("hea", record, WFDB_WRITE)) == NULL) {
+    if (stat == 0 &&
+	(oheader = wfdb_open("hea", record, WFDB_WRITE)) == NULL) {
 	wfdb_error("newheader: can't create header for record %s\n", record);
+	stat = -1;
+    }
+    if (stat != 0) {
+	if (fname) {
+	    for (s = 0; s < nsig; s++)
+		SFREE(fname[s]);
+	    SFREE(fname);
+	}
 	return (-1);
     }
 
     /* Write the general information line. */
-    (void)wfdb_fprintf(oheader, "%s %d %.12g", record, nsig, ffreq);
+    (void)wfdb_fprintf(oheader, "%.*s %d %.12g", rnlen, rname, nsig, ffreq);
     if ((cfreq > 0.0 && cfreq != ffreq) || bcount != 0.0) {
 	(void)wfdb_fprintf(oheader, "/%.12g", cfreq);
 	if (bcount != 0.0)
@@ -3898,7 +3958,9 @@ FINT setheader(char *record, const WFDB_Siginfo *siarray, unsigned int nsig)
 
     /* Write a signal specification line for each signal. */
     for (s = 0; s < nsig; s++) {
-	(void)wfdb_fprintf(oheader, "%s %d", siarray[s].fname, siarray[s].fmt);
+	(void)wfdb_fprintf(oheader, "%s %d",
+			   (fname && fname[s]) ? fname[s] : siarray[s].fname,
+			   siarray[s].fmt);
 	if (siarray[s].spf > 1)
 	    (void)wfdb_fprintf(oheader, "x%d", siarray[s].spf);
 	if (osd && osd[s]->skew)
@@ -3922,6 +3984,11 @@ FINT setheader(char *record, const WFDB_Siginfo *siarray, unsigned int nsig)
     }
     prolog_bytes = 0L;
     (void)wfdb_fflush(oheader);
+    if (fname) {
+	for (s = 0; s < nsig; s++)
+	    SFREE(fname[s]);
+	SFREE(fname);
+    }
     return (0);
 }
 
@@ -3954,6 +4021,12 @@ FINT setmsheader(char *record, char **segment_name, unsigned int nsegments)
     /* Quit (with message from wfdb_checkname) if name is illegal. */
     if (wfdb_checkname(record, "record"))
 	return (-1);
+
+    if (wfdb_isarchive(record)) {
+	wfdb_error(
+	   "setmsheader: multi-segment records in archives are not supported\n");
+	return (-1);
+    }
 
     if (nsegments < 1) {
 	wfdb_error("setmsheader: record must contain at least one segment\n");
@@ -4685,6 +4758,7 @@ void wfdb_sigclose(void)
 {
     isigclose();
     osigclose();
+    SFREE(iarchive);
     btime = bdate = nsamples = msbtime = msbdate = msnsamples = (WFDB_Time)0;
     sfreq = ifreq = ffreq = (WFDB_Frequency)0;
     pdays = (WFDB_Date)-1;

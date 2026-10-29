@@ -46,6 +46,7 @@ FVOID wfdbquit(void)
     wfdb_anclose();	/* close annotation files, reset variables */
     wfdb_oinfoclose();	/* close info file */
     wfdb_sigclose();	/* close signals, reset variables */
+    wfdb_archive_close_all(); /* write output archives */
     resetwfdb();	/* restore the WFDB path */
     wfdb_sampquit();	/* release sample data buffer */
     wfdb_freeinfo();	/* release info strings */

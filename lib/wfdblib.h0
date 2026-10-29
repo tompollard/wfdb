@@ -204,11 +204,13 @@ struct WFDB_FILE {
   FILE *fp;
   struct netfile *netfp;
   int type;
+  struct wfdb_member *member;	/* used only if type is WFDB_ARCHIVE */
 };
 
 /* Values for WFDB_FILE 'type' field */
 #define WFDB_LOCAL	0	/* a local file, read via C standard I/O */
 #define WFDB_NET	1	/* a remote file, read via libwww */
+#define WFDB_ARCHIVE	2	/* a file within a .wfdb archive */
 
 /* Composite data types */
 typedef struct netfile netfile;
@@ -307,6 +309,12 @@ __attribute__((__format__(__printf__, 2, 3)))
 extern int wfdb_fprintf(WFDB_FILE *fp, const char *format, ...);
 extern void wfdb_setirec(const char *record_name);
 extern char *wfdb_getirec(void);
+extern int wfdb_isarchive(const char *record_name);
+extern int wfdb_archive_split(const char *fname, char **archive,
+			      char **member);
+extern WFDB_FILE *wfdb_archive_open(const char *archive, const char *member);
+extern const char *wfdb_archive_name(WFDB_FILE *fp);
+extern int wfdb_archive_close_all(void);
 
 extern void wfdb_clearerr(WFDB_FILE *fp);
 extern int wfdb_feof(WFDB_FILE *fp);
@@ -339,14 +347,16 @@ extern void wfdb_oaflush(void);
 #else        /* declare only function return types for non-ANSI C compilers */
 
 extern char *wfdb_getirec();
+extern const char *wfdb_archive_name();
 extern int wfdb_fclose(), wfdb_checkname(), wfdb_g16(), wfdb_parse_path(),
-    wfdb_fprintf();
+    wfdb_fprintf(), wfdb_isarchive(), wfdb_archive_split(),
+    wfdb_archive_close_all();
 extern long wfdb_g32();
 extern void wfdb_striphea(), wfdb_p16(), wfdb_p32(), wfdb_addtopath(),
     wfdb_setirec(), wfdb_sampquit(), wfdb_sigclose(),
     wfdb_osflush(), wfdb_freeinfo(), wfdb_oinfoclose(),
     wfdb_anclose(), wfdb_oaflush();
-extern WFDB_FILE *wfdb_open(), *wfdb_fopen();
+extern WFDB_FILE *wfdb_open(), *wfdb_fopen(), *wfdb_archive_open();
 
 extern char *wfdb_fgets();
 extern int wfdb_feof(), wfdb_ferror(), wfdb_fflush(), wfdb_fseek(),

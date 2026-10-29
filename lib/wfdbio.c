@@ -69,6 +69,11 @@ library functions defined elsewhere:
  wfdb_striphea [10.4.5] (removes trailing '.hea' from a record name, if present)
  wfdb_setirec [9.7]	(saves current record name)
  wfdb_getirec [10.5.12]	(gets current record name)
+ wfdb_isarchive (checks whether a record name refers to an archive)
+ wfdb_archive_split (splits a file name into archive and member)
+ wfdb_archive_open (opens a file within an archive for reading)
+ wfdb_archive_name (returns the archive containing an open file)
+ wfdb_archive_close_all (writes all archives opened for output)
 
 (Numbers in brackets in the lists above indicate the first version of the WFDB
 library that included the corresponding function.  Functions not so marked
@@ -157,6 +162,7 @@ module.
 */
 
 #include "wfdblib.h"
+#include <limits.h>
 #include <time.h>
 
 /* WFDB library functions */
@@ -917,6 +923,8 @@ static int nf_vfprintf(netfile *nf, const char *format, va_list ap)
 }
 #endif
 
+static int am_readonly(WFDB_FILE *wp);
+
 int wfdb_fprintf(WFDB_FILE *wp, const char *format, ...)
 {
     int ret;
@@ -928,6 +936,9 @@ int wfdb_fprintf(WFDB_FILE *wp, const char *format, ...)
 	ret = nf_vfprintf(wp->netfp, format, args);
     else
 #endif
+    if (am_readonly(wp))
+	ret = -1;		/* opened for reading only */
+    else
 	ret = vfprintf(wp->fp, format, args);
     va_end(args);
     return (ret);
@@ -1196,6 +1207,11 @@ WFDB_FILE *wfdb_open(const char *s, const char *record, int mode)
 
 int wfdb_checkname(const char *p, const char *s)
 {
+    const char *end = p + strlen(p);
+
+    /* A record name may end with ".wfdb", designating an archive. */
+    if (strcmp(s, "record") == 0 && wfdb_isarchive(p))
+	end -= 5;
     do {
 	if (('0' <= *p && *p <= '9') || *p == '_' || *p == '~' || *p== '-' ||
 	    *p == DSEP ||
@@ -1208,7 +1224,7 @@ int wfdb_checkname(const char *p, const char *s)
 	    wfdb_error("init: illegal character %d in %s name\n", *p, s);
 	    return (-1);
 	}
-    } while (*p);
+    } while (p < end);
     return (0);
 }
 
@@ -2076,6 +2092,1097 @@ static int nf_putc(int c, netfile *nf)
 # define nf_putc(c, nf)                   (EOF)
 #endif
 
+/* WFDB archive functions
+
+A WFDB archive is a ZIP file, named RECORD.wfdb, that holds the files of a
+single record: its header file (RECORD.hea), the signal files listed in the
+header, and optionally annotation and other files.  All files are at the top
+level of the archive.  Files are normally stored without compression, so that
+any range of samples can be read without reading the rest of the signal file.
+
+A record in an archive is opened by giving its name with the '.wfdb'
+extension (for example, isigopen("100.wfdb", ...) or annopen("100.wfdb",
+...)).  wfdb_open then constructs a file name such as "100.wfdb.hea", which
+wfdb_fopen recognizes (using wfdb_archive_split) as the file "100.hea" within
+the archive "100.wfdb".  The archive itself is found by searching the WFDB
+path in the usual way.  The signal files of a record in an archive are read
+from the same archive (see isigopen, in signal.c).
+
+Files written to an archive (for example, by setheader("100.wfdb", ...),
+annopen("100.wfdb", ...), or osigfopen with a signal file name such as
+"100.wfdb.dat") are collected in temporary files until wfdbquit is invoked
+(or until the program exits).  At that point, wfdb_archive_close_all writes a
+new archive that contains these files and any other files from the existing
+archive, if there is one, and moves it into place.  If anything goes wrong,
+the existing archive is left unchanged.
+
+Archives on remote (http or ftp) servers, multi-segment records in archives,
+and compressed files within archives are not supported.
+
+These functions are intended only for use by other functions in the WFDB
+library:
+ wfdb_isarchive		(checks whether a record name refers to an archive)
+ wfdb_archive_split	(splits a file name into archive and member names)
+ wfdb_archive_open	(opens a file within an archive for reading)
+ wfdb_archive_name	(returns the archive containing an open WFDB_FILE)
+ wfdb_archive_close_all	(writes all archives opened for output)
+*/
+
+#define WFDB_ARCHIVE_EXT	".wfdb"
+#define WFDB_ARCHIVE_EXTLEN	5
+#define ARCHIVE_MAX_HEADER	(1024L*1024L) /* largest header to be read */
+#define ARCHIVE_MAX_CDIR	(64L*1024L*1024L) /* largest central directory */
+#define ZIP_LIMIT16		0xffffUL
+#define ZIP_LIMIT32		0xffffffffUL
+
+typedef unsigned long long zip_u64;
+
+/* A file within an archive, opened via a WFDB_FILE */
+struct wfdb_member {
+    char *archive;		/* path of the archive */
+    char *name;			/* name of the file within the archive */
+    long start;			/* (input) offset of file data in the archive */
+    long size;			/* (input) length of the file */
+    long pos;			/* (input) current position within the file */
+    int eof, err;		/* (input) end-of-file and error indicators */
+    struct archive_out_file *out; /* (output) file being written, or NULL */
+};
+
+/* An entry in the central directory of a ZIP file */
+struct zip_entry {
+    char *name;
+    unsigned int method, flags, time, date;
+    unsigned long crc;
+    zip_u64 csize, usize, offset;
+    struct archive_out_file *replacement; /* (output) new version, or NULL */
+};
+
+struct zip_dir {
+    struct zip_entry *entry;
+    unsigned long n;
+};
+
+/* A file to be written to an output archive */
+struct archive_out_file {
+    char *name;
+    FILE *tmp;			/* temporary file holding the contents */
+    int open;			/* true if a WFDB_FILE refers to this file */
+    struct archive_out_file *next;
+};
+
+/* An archive opened for output */
+struct archive_out {
+    char *path;
+    struct archive_out_file *files;
+    struct archive_out *next;
+};
+
+static struct archive_out *archive_out_list;
+
+#if !defined(MSDOS) && !defined(_WIN32)
+#include <sys/stat.h>	/* for stat and chmod */
+#endif
+
+static int lower(int c)
+{
+    return ((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+}
+
+static int is_dsep(int c)
+{
+    return (c == '/' || c == DSEP
+#ifdef MSDOS
+	    || c == ':' || c == '\\'
+#endif
+	);
+}
+
+/* Returns true if s ends with ".wfdb" (in either case). */
+static int has_archive_ext(const char *s, size_t len)
+{
+    size_t i;
+
+    if (len <= WFDB_ARCHIVE_EXTLEN || is_dsep(s[len-WFDB_ARCHIVE_EXTLEN-1]))
+	return (0);
+    for (i = 0; i < WFDB_ARCHIVE_EXTLEN; i++)
+	if (lower(s[len-WFDB_ARCHIVE_EXTLEN+i]) != WFDB_ARCHIVE_EXT[i])
+	    return (0);
+    return (1);
+}
+
+/* wfdb_isarchive returns true if a record name refers to an archive (if
+   it ends with ".wfdb"). */
+int wfdb_isarchive(const char *record)
+{
+    return (record && has_archive_ext(record, strlen(record)));
+}
+
+/* Returns true if s is a valid name for a file within an archive:  one or
+   more non-empty components separated by '.', each made up of ASCII
+   letters, digits, hyphens, and underscores. */
+static int valid_member_name(const char *s)
+{
+    int n = 0;
+
+    for ( ; *s; s++) {
+	if (*s == '.') {
+	    if (n == 0) return (0);
+	    n = 0;
+	}
+	else if (('0' <= *s && *s <= '9') || ('a' <= *s && *s <= 'z') ||
+		 ('A' <= *s && *s <= 'Z') || *s == '-' || *s == '_')
+	    n++;
+	else
+	    return (0);
+    }
+    return (n > 0);
+}
+
+/* Returns true if s is a valid name for a header file within an archive. */
+static int is_header_name(const char *s)
+{
+    size_t len = strlen(s);
+
+    return (len > 4 && strcmp(s + len - 4, ".hea") == 0 &&
+	    strchr(s, '.') == s + len - 4 && valid_member_name(s));
+}
+
+/* Returns a pointer to the final component of a path. */
+static const char *base_name(const char *path, const char *end)
+{
+    const char *p = end;
+
+    while (p > path && !is_dsep(*(p-1)))
+	p--;
+    return (p);
+}
+
+/* wfdb_archive_split checks whether fname is the name of a file within an
+archive, of the form "PATH/RECORD.wfdb.EXT".  If so, it sets *archive to
+"PATH/RECORD.wfdb" and *member to "RECORD.EXT" (both allocated using
+malloc), and returns 1;  otherwise, it returns 0. */
+int wfdb_archive_split(const char *fname, char **archive, char **member)
+{
+    const char *p, *q, *b;
+    size_t len;
+
+    *archive = *member = NULL;
+    if (fname == NULL)
+	return (0);
+    for (p = fname + strlen(fname) - 1; p > fname; p--) {
+	if (is_dsep(*p))
+	    return (0);
+	if (*p == '.' && has_archive_ext(fname, p - fname))
+	    break;
+    }
+    if (p <= fname || *(p+1) == '\0')
+	return (0);
+    len = p - fname;
+    q = p - WFDB_ARCHIVE_EXTLEN;	/* end of the record name */
+    b = base_name(fname, q);
+    SUALLOC(*archive, len + 1, 1);
+    SUALLOC(*member, (q - b) + strlen(p) + 1, 1);
+    if (*archive == NULL || *member == NULL) {
+	SFREE(*archive);
+	SFREE(*member);
+	return (0);
+    }
+    memcpy(*archive, fname, len);
+    memcpy(*member, b, q - b);
+    strcpy(*member + (q - b), p);
+    return (1);
+}
+
+/* Little-endian integer encoding and decoding */
+
+static unsigned int zget16(const unsigned char *p)
+{
+    return (p[0] | (p[1] << 8));
+}
+
+static unsigned long zget32(const unsigned char *p)
+{
+    return ((unsigned long)zget16(p) | ((unsigned long)zget16(p+2) << 16));
+}
+
+static zip_u64 zget64(const unsigned char *p)
+{
+    return ((zip_u64)zget32(p) | ((zip_u64)zget32(p+4) << 32));
+}
+
+static unsigned char *zput16(unsigned char *p, unsigned int x)
+{
+    p[0] = x & 0xff; p[1] = (x >> 8) & 0xff;
+    return (p + 2);
+}
+
+static unsigned char *zput32(unsigned char *p, unsigned long x)
+{
+    zput16(p, x & 0xffff); zput16(p+2, (x >> 16) & 0xffff);
+    return (p + 4);
+}
+
+static unsigned char *zput64(unsigned char *p, zip_u64 x)
+{
+    zput32(p, (unsigned long)(x & ZIP_LIMIT32));
+    zput32(p+4, (unsigned long)((x >> 32) & ZIP_LIMIT32));
+    return (p + 8);
+}
+
+/* CRC-32, as used in ZIP files */
+static unsigned long crc32_update(unsigned long crc, const unsigned char *buf,
+				  size_t len)
+{
+    static unsigned long table[256];
+    static int table_ready = 0;
+    unsigned long c;
+    int i, k;
+
+    if (!table_ready) {
+	for (i = 0; i < 256; i++) {
+	    c = (unsigned long)i;
+	    for (k = 0; k < 8; k++)
+		c = (c & 1) ? 0xedb88320UL ^ (c >> 1) : c >> 1;
+	    table[i] = c;
+	}
+	table_ready = 1;
+    }
+    crc ^= ZIP_LIMIT32;
+    while (len-- > 0)
+	crc = table[(crc ^ *buf++) & 0xff] ^ (crc >> 8);
+    return (crc ^ ZIP_LIMIT32);
+}
+
+static int read_at(FILE *f, zip_u64 offset, void *buf, size_t len)
+{
+    if (offset > (zip_u64)LONG_MAX || fseek(f, (long)offset, SEEK_SET) != 0 ||
+	fread(buf, 1, len, f) != len)
+	return (-1);
+    return (0);
+}
+
+static void free_zip_dir(struct zip_dir *d)
+{
+    unsigned long i;
+
+    for (i = 0; i < d->n; i++)
+	SFREE(d->entry[i].name);
+    SFREE(d->entry);
+    d->n = 0;
+}
+
+/* read_zip_dir reads the central directory of the ZIP file f into d.  It
+   returns 0 if successful, or -1 (after reporting an error) otherwise. */
+static int read_zip_dir(FILE *f, const char *path, struct zip_dir *d)
+{
+    unsigned char *buf = NULL, *p, *end, z[56];
+    long flen, tail, eocd;
+    zip_u64 n, cdsize, cdoff, z64off;
+    unsigned long i;
+
+    d->entry = NULL;
+    d->n = 0;
+    if (fseek(f, 0L, SEEK_END) != 0 || (flen = ftell(f)) < 22)
+	goto bad;
+
+    /* Find the end of central directory record, which is followed by a
+       comment of up to 65535 bytes. */
+    tail = (flen < 65535L + 22) ? flen : 65535L + 22;
+    SUALLOC(buf, tail, 1);
+    if (buf == NULL || read_at(f, flen - tail, buf, tail))
+	goto bad;
+    for (eocd = tail - 22; eocd >= 0; eocd--)
+	if (zget32(buf + eocd) == 0x06054b50UL)
+	    break;
+    if (eocd < 0)
+	goto bad;
+    p = buf + eocd;
+    if (zget16(p+4) != 0 && zget16(p+4) != ZIP_LIMIT16) {
+	wfdb_error("WFDB: archive %s spans multiple files\n", path);
+	goto err;
+    }
+    n = zget16(p+10);
+    cdsize = zget32(p+12);
+    cdoff = zget32(p+16);
+    eocd += flen - tail;	/* offset of the record within the file */
+
+    /* Read the ZIP64 end of central directory record if there is one. */
+    if (n == ZIP_LIMIT16 || cdsize == ZIP_LIMIT32 || cdoff == ZIP_LIMIT32) {
+	if (eocd < 20 || read_at(f, eocd - 20, z, 20) ||
+	    zget32(z) != 0x07064b50UL)
+	    goto bad;
+	z64off = zget64(z+8);
+	if (read_at(f, z64off, z, 56) || zget32(z) != 0x06064b50UL)
+	    goto bad;
+	n = zget64(z+32);
+	cdsize = zget64(z+40);
+	cdoff = zget64(z+48);
+    }
+    if (cdoff > (zip_u64)flen || cdsize > (zip_u64)flen - cdoff)
+	goto bad;
+    if (cdsize > ARCHIVE_MAX_CDIR) {
+	wfdb_error("WFDB: archive %s has too many files\n", path);
+	goto err;
+    }
+    if (n > cdsize / 46)
+	goto bad;
+
+    /* Read the central directory. */
+    SFREE(buf);
+    SUALLOC(buf, (size_t)cdsize, 1);
+    if (buf == NULL || read_at(f, cdoff, buf, (size_t)cdsize))
+	goto bad;
+    SUALLOC(d->entry, (size_t)n, sizeof(struct zip_entry));
+    if (d->entry == NULL)
+	goto err;
+    for (p = buf, end = buf + cdsize, i = 0; i < n; i++) {
+	struct zip_entry *e = &d->entry[i];
+	unsigned int nlen, xlen, clen;
+	unsigned char *x, *xend;
+
+	if (end - p < 46 || zget32(p) != 0x02014b50UL)
+	    goto bad;
+	e->flags = zget16(p+8);
+	e->method = zget16(p+10);
+	e->time = zget16(p+12);
+	e->date = zget16(p+14);
+	e->crc = zget32(p+16);
+	e->csize = zget32(p+20);
+	e->usize = zget32(p+24);
+	nlen = zget16(p+28);
+	xlen = zget16(p+30);
+	clen = zget16(p+32);
+	e->offset = zget32(p+42);
+	if ((size_t)(end - p) < 46 + (size_t)nlen + xlen + clen)
+	    goto bad;
+	SUALLOC(e->name, nlen + 1, 1);
+	if (e->name == NULL)
+	    goto err;
+	memcpy(e->name, p+46, nlen);
+	d->n = i + 1;
+
+	/* Look for 64-bit sizes and offsets in the ZIP64 extra field. */
+	for (x = p + 46 + nlen, xend = x + xlen; xend - x >= 4;
+	     x += 4 + zget16(x+2)) {
+	    unsigned char *y = x + 4, *yend = y + zget16(x+2);
+
+	    if (yend > xend)
+		goto bad;
+	    if (zget16(x) != 0x0001)
+		continue;
+	    if (e->usize == ZIP_LIMIT32) {
+		if (yend - y < 8) goto bad;
+		e->usize = zget64(y); y += 8;
+	    }
+	    if (e->csize == ZIP_LIMIT32) {
+		if (yend - y < 8) goto bad;
+		e->csize = zget64(y); y += 8;
+	    }
+	    if (e->offset == ZIP_LIMIT32) {
+		if (yend - y < 8) goto bad;
+		e->offset = zget64(y); y += 8;
+	    }
+	}
+	p += 46 + nlen + xlen + clen;
+    }
+    SFREE(buf);
+    return (0);
+
+ bad:
+    wfdb_error("WFDB: %s is not a valid WFDB archive\n", path);
+ err:
+    SFREE(buf);
+    free_zip_dir(d);
+    return (-1);
+}
+
+static struct zip_entry *find_zip_entry(struct zip_dir *d, const char *name)
+{
+    unsigned long i;
+
+    for (i = 0; i < d->n; i++)
+	if (strcmp(d->entry[i].name, name) == 0)
+	    return (&d->entry[i]);
+    return (NULL);
+}
+
+/* zip_data_offset finds the offset of the data for entry e in f, which is
+   after the entry's local file header.  It returns 0 if successful, or
+   -1 (after reporting an error) otherwise. */
+static int zip_data_offset(FILE *f, const char *path, struct zip_entry *e,
+			   zip_u64 *offset)
+{
+    unsigned char h[30];
+
+    if (read_at(f, e->offset, h, 30) || zget32(h) != 0x04034b50UL) {
+	wfdb_error("WFDB: %s is not a valid WFDB archive\n", path);
+	return (-1);
+    }
+    *offset = e->offset + 30 + zget16(h+26) + zget16(h+28);
+    return (0);
+}
+
+/* open_member opens the file named name within the archive at path for
+reading.  If there is no such file, and name is the name of a header file,
+the archive's only header file (if it has exactly one) is opened instead.
+open_member returns NULL if the archive can't be opened or doesn't contain
+the file (and reports an error if the archive is invalid). */
+static WFDB_FILE *open_member(const char *path, const char *name)
+{
+    FILE *f;
+    struct zip_dir d;
+    struct zip_entry *e;
+    zip_u64 start;
+    unsigned long i, nheaders = 0;
+    WFDB_FILE *wp = NULL;
+    struct wfdb_member *m = NULL;
+    size_t len = strlen(name);
+
+    if ((f = fopen(path, RB)) == NULL)
+	return (NULL);
+    if (read_zip_dir(f, path, &d) < 0) {
+	fclose(f);
+	return (NULL);
+    }
+    if ((e = find_zip_entry(&d, name)) == NULL &&
+	len > 4 && strcmp(name + len - 4, ".hea") == 0) {
+	for (i = 0; i < d.n; i++)
+	    if (is_header_name(d.entry[i].name)) {
+		e = &d.entry[i];
+		nheaders++;
+	    }
+	if (nheaders != 1)
+	    e = NULL;
+    }
+    if (e == NULL)
+	goto fail;
+    if (e->flags & 1) {
+	wfdb_error("WFDB: %s in archive %s is encrypted\n", e->name, path);
+	goto fail;
+    }
+    if (e->method != 0 || e->csize != e->usize) {
+	wfdb_error("WFDB: %s in archive %s is compressed (only uncompressed"
+		   " files can be read from archives)\n", e->name, path);
+	goto fail;
+    }
+    if (is_header_name(e->name) && e->usize > ARCHIVE_MAX_HEADER) {
+	wfdb_error("WFDB: header %s in archive %s is larger than %ld bytes\n",
+		   e->name, path, ARCHIVE_MAX_HEADER);
+	goto fail;
+    }
+    if (zip_data_offset(f, path, e, &start) < 0)
+	goto fail;
+    if (start > (zip_u64)LONG_MAX || e->usize > (zip_u64)LONG_MAX - start) {
+	wfdb_error("WFDB: %s in archive %s is too large\n", e->name, path);
+	goto fail;
+    }
+    SUALLOC(wp, 1, sizeof(WFDB_FILE));
+    SUALLOC(m, 1, sizeof(struct wfdb_member));
+    if (wp == NULL || m == NULL)
+	goto fail;
+    SSTRCPY(m->archive, path);
+    SSTRCPY(m->name, e->name);
+    if (m->archive == NULL || m->name == NULL)
+	goto fail;
+    m->start = (long)start;
+    m->size = (long)e->usize;
+    if (fseek(f, m->start, SEEK_SET) != 0)
+	goto fail;
+    wp->type = WFDB_ARCHIVE;
+    wp->fp = f;
+    wp->member = m;
+    free_zip_dir(&d);
+    return (wp);
+
+ fail:
+    if (m) {
+	SFREE(m->archive);
+	SFREE(m->name);
+	SFREE(m);
+    }
+    SFREE(wp);
+    free_zip_dir(&d);
+    fclose(f);
+    return (NULL);
+}
+
+/* wfdb_archive_open opens the file named member within an archive for
+   reading.  Unlike wfdb_open, it does not search the WFDB path. */
+WFDB_FILE *wfdb_archive_open(const char *archive, const char *member)
+{
+    if (archive == NULL || member == NULL || strstr(archive, "://"))
+	return (NULL);
+    return (open_member(archive, member));
+}
+
+/* wfdb_archive_name returns the path of the archive that contains an open
+   file, or NULL if the file is not within an archive. */
+const char *wfdb_archive_name(WFDB_FILE *wp)
+{
+    if (wp && wp->type == WFDB_ARCHIVE)
+	return (wp->member->archive);
+    return (NULL);
+}
+
+static void free_archive_out(struct archive_out *a)
+{
+    struct archive_out_file *o, *next;
+
+    for (o = a->files; o; o = next) {
+	next = o->next;
+	if (o->tmp) fclose(o->tmp);
+	SFREE(o->name);
+	SFREE(o);
+    }
+    SFREE(a->path);
+    SFREE(a);
+}
+
+/* remove_out_file removes a file from an output archive. */
+static void remove_out_file(struct archive_out *a, struct archive_out_file *o)
+{
+    struct archive_out_file **op;
+
+    for (op = &a->files; *op; op = &(*op)->next)
+	if (*op == o) {
+	    *op = o->next;
+	    break;
+	}
+    if (o->tmp) fclose(o->tmp);
+    SFREE(o->name);
+    SFREE(o);
+}
+
+static void archive_atexit(void)
+{
+    (void)wfdb_archive_close_all();
+}
+
+/* copy_member copies the contents of an uncompressed file named name
+   within the archive at path, if there is one, to f. */
+static int copy_member(const char *path, const char *name, FILE *f)
+{
+    WFDB_FILE *wp;
+    char buf[8192];
+    size_t n;
+    int stat = 0;
+
+    if ((wp = open_member(path, name)) == NULL)
+	return (0);
+    while ((n = wfdb_fread(buf, 1, sizeof(buf), wp)) > 0)
+	if (fwrite(buf, 1, n, f) != n) {
+	    stat = -1;
+	    break;
+	}
+    if (wfdb_ferror(wp))
+	stat = -1;
+    wfdb_fclose(wp);
+    return (stat);
+}
+
+/* open_output_member opens the file named name within the archive at path
+for writing (mode WB) or appending (mode AB).  The file's contents are kept
+in a temporary file until wfdb_archive_close_all is invoked. */
+static WFDB_FILE *open_output_member(const char *path, const char *name,
+				     const char *mode)
+{
+    static int first_call = 1;
+    struct archive_out *a;
+    struct archive_out_file *o, **op;
+    WFDB_FILE *wp = NULL;
+    struct wfdb_member *m = NULL;
+    int append = (*mode == 'a');
+    size_t len = strlen(path);
+    const char *b = base_name(path, path + len);
+
+    if (!valid_member_name(name)) {
+	wfdb_error("WFDB: can't write %s to archive %s (names of files in"
+		   " archives must contain only letters, digits, hyphens,"
+		   " underscores, and dots)\n", name, path);
+	return (NULL);
+    }
+    if (is_header_name(name) &&
+	(strncmp(name, b, (path + len - WFDB_ARCHIVE_EXTLEN) - b) != 0 ||
+	 strlen(name) != (size_t)(path + len - WFDB_ARCHIVE_EXTLEN - b) + 4)) {
+	wfdb_error("WFDB: can't write %s to archive %s (an archive can"
+		   " contain only the header file named after it)\n",
+		   name, path);
+	return (NULL);
+    }
+
+    /* Find the output archive, or start a new one. */
+    for (a = archive_out_list; a; a = a->next)
+	if (strcmp(a->path, path) == 0)
+	    break;
+    if (a == NULL) {
+	SUALLOC(a, 1, sizeof(struct archive_out));
+	if (a == NULL)
+	    return (NULL);
+	SSTRCPY(a->path, path);
+	if (a->path == NULL) {
+	    SFREE(a);
+	    return (NULL);
+	}
+	a->next = archive_out_list;
+	archive_out_list = a;
+	if (first_call) {
+	    atexit(archive_atexit);
+	    first_call = 0;
+	}
+    }
+
+    /* Find the file, or add a new one. */
+    for (o = a->files; o; o = o->next)
+	if (strcmp(o->name, name) == 0)
+	    break;
+    if (o && o->open) {
+	wfdb_error("WFDB: %s in archive %s is already open\n", name, path);
+	return (NULL);
+    }
+    if (o == NULL) {
+	SUALLOC(o, 1, sizeof(struct archive_out_file));
+	if (o == NULL)
+	    return (NULL);
+	SSTRCPY(o->name, name);
+	if (o->name == NULL || (o->tmp = tmpfile()) == NULL) {
+	    if (o->name)
+		wfdb_error("WFDB: can't create a temporary file for %s in"
+			   " archive %s\n", name, path);
+	    SFREE(o->name);
+	    SFREE(o);
+	    return (NULL);
+	}
+	for (op = &a->files; *op; op = &(*op)->next)
+	    ;
+	*op = o;	/* keep the files in the order they were created */
+	/* When appending to a file that is already in the archive, start
+	   with its current contents. */
+	if (append && copy_member(path, name, o->tmp) < 0) {
+	    wfdb_error("WFDB: can't read %s from archive %s\n", name, path);
+	    remove_out_file(a, o);
+	    return (NULL);
+	}
+    }
+    else if (!append) {
+	/* Start again with an empty file. */
+	fclose(o->tmp);
+	if ((o->tmp = tmpfile()) == NULL) {
+	    wfdb_error("WFDB: can't create a temporary file for %s in"
+		       " archive %s\n", name, path);
+	    remove_out_file(a, o);
+	    return (NULL);
+	}
+    }
+
+    SUALLOC(wp, 1, sizeof(WFDB_FILE));
+    SUALLOC(m, 1, sizeof(struct wfdb_member));
+    if (m) {
+	SSTRCPY(m->archive, path);
+	SSTRCPY(m->name, name);
+    }
+    if (wp == NULL || m == NULL || m->archive == NULL || m->name == NULL ||
+	fseek(o->tmp, 0L, SEEK_END) != 0) {
+	if (m) {
+	    SFREE(m->archive);
+	    SFREE(m->name);
+	}
+	SFREE(m);
+	SFREE(wp);
+	return (NULL);
+    }
+    m->out = o;
+    o->open = 1;
+    wp->type = WFDB_ARCHIVE;
+    wp->fp = o->tmp;
+    wp->member = m;
+    return (wp);
+}
+
+/* Functions for reading and writing files within archives, used by the
+   wfdb_f* functions below */
+
+/* am_readonly returns true if wp is a file within an archive that was
+   opened for reading. */
+static int am_readonly(WFDB_FILE *wp)
+{
+    return (wp->type == WFDB_ARCHIVE && wp->member->out == NULL);
+}
+
+static int am_getc(WFDB_FILE *wp)
+{
+    struct wfdb_member *m = wp->member;
+    int c;
+
+    if (m->out)
+	return (getc(wp->fp));
+    if (m->pos >= m->size) {
+	m->eof = 1;
+	return (EOF);
+    }
+    if ((c = getc(wp->fp)) == EOF) {
+	m->err = ferror(wp->fp) ? 1 : 0;
+	m->eof = 1;
+	return (EOF);
+    }
+    m->pos++;
+    return (c);
+}
+
+static char *am_fgets(char *s, int size, WFDB_FILE *wp)
+{
+    int c = 0, i = 0;
+
+    if (wp->member->out)
+	return (fgets(s, size, wp->fp));
+    if (size <= 0)
+	return (NULL);
+    while (i < size - 1 && (c = am_getc(wp)) != EOF) {
+	s[i++] = c;
+	if (c == '\n')
+	    break;
+    }
+    if (i == 0)
+	return (NULL);
+    s[i] = '\0';
+    return (s);
+}
+
+static size_t am_fread(void *ptr, size_t size, size_t nmemb, WFDB_FILE *wp)
+{
+    struct wfdb_member *m = wp->member;
+    size_t n, avail;
+
+    if (m->out)
+	return (fread(ptr, size, nmemb, wp->fp));
+    if (size == 0 || nmemb == 0)
+	return (0);
+    avail = (m->pos < m->size) ? (size_t)(m->size - m->pos) : 0;
+    if (nmemb > avail / size) {
+	nmemb = avail / size;
+	m->eof = 1;
+    }
+    n = fread(ptr, size, nmemb, wp->fp);
+    m->pos += (long)(n * size);
+    if (n < nmemb) {
+	m->err = ferror(wp->fp) ? 1 : 0;
+	m->eof = 1;
+    }
+    return (n);
+}
+
+static int am_fseek(WFDB_FILE *wp, long offset, int whence)
+{
+    struct wfdb_member *m = wp->member;
+    long pos;
+
+    if (m->out)
+	return (fseek(wp->fp, offset, whence));
+    switch (whence) {
+      case SEEK_SET: pos = 0; break;
+      case SEEK_CUR: pos = m->pos; break;
+      case SEEK_END: pos = m->size; break;
+      default: return (-1);
+    }
+    if ((offset < 0 && pos + offset < 0) ||
+	(offset > 0 && offset > LONG_MAX - m->start - pos))
+	return (-1);
+    pos += offset;
+    if (fseek(wp->fp, m->start + pos, SEEK_SET) != 0)
+	return (-1);
+    m->pos = pos;
+    m->eof = 0;
+    return (0);
+}
+
+static int archive_mkdirs(char *fname);
+
+/* write_archive writes a new archive containing the files in a, and any
+other files from the existing archive (if any), to a temporary file, then
+moves it into place.  It returns 0 if successful, or -1 (after reporting an
+error) otherwise;  in that case, any existing archive is left unchanged. */
+static int write_archive(struct archive_out *a)
+{
+    FILE *old = NULL, *f = NULL;
+    struct zip_dir d;
+    struct zip_entry *cd = NULL, *e;
+    struct archive_out_file *o;
+    char *tmpname = NULL, buf[8192];
+    unsigned char h[64], *p;
+    unsigned long nfiles = 0, i, nentries;
+    zip_u64 off = 0, cdoff, cdsize = 0;
+    size_t n, len = strlen(a->path);
+    const char *b = base_name(a->path, a->path + len);
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    unsigned int dostime = 0, dosdate = (1 << 5) | 1;
+    int status = -1, replacing = 0, attempt, cstat;
+#if !defined(MSDOS) && !defined(_WIN32)
+    struct stat st;
+#endif
+
+    d.entry = NULL;
+    d.n = 0;
+    if (tm && tm->tm_year >= 80) {
+	dostime = (tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec / 2);
+	dosdate = ((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) |
+	    tm->tm_mday;
+    }
+
+    /* Read the directory of the existing archive, if there is one. */
+    if ((old = fopen(a->path, RB)) != NULL) {
+	replacing = 1;
+	if (read_zip_dir(old, a->path, &d) < 0)
+	    goto done;
+    }
+
+    /* Create a temporary file next to the archive. */
+    for (attempt = 0; attempt < 100; attempt++) {
+	FILE *tf;
+
+	wfdb_asprintf(&tmpname, "%.*s.%s.%04x%04x.tmp", (int)(b - a->path),
+		      a->path, b, (unsigned int)(t & 0xffff),
+		      (unsigned int)((attempt * 40503U + (unsigned long)clock())
+				     & 0xffff));
+	if (tmpname == NULL)
+	    goto done;
+	if ((tf = fopen(tmpname, RB)) != NULL) {
+	    fclose(tf);
+	    continue;
+	}
+	if ((f = fopen(tmpname, WB)) == NULL) {
+	    archive_mkdirs(tmpname);
+	    f = fopen(tmpname, WB);
+	}
+	break;
+    }
+    if (f == NULL) {
+	wfdb_error("WFDB: can't create a temporary file for archive %s\n",
+		   a->path);
+	goto done;
+    }
+
+    /* Make a list of the files to be written:  files from the existing
+       archive (unless they are being replaced), followed by new files. */
+    for (o = a->files; o; o = o->next)
+	nfiles++;
+    SUALLOC(cd, d.n + nfiles, sizeof(struct zip_entry));
+    if (cd == NULL)
+	goto done;
+    nentries = 0;
+    for (i = 0; i < d.n; i++) {
+	for (o = a->files; o; o = o->next)
+	    if (strcmp(o->name, d.entry[i].name) == 0)
+		break;
+	if (o == NULL)
+	    cd[nentries++] = d.entry[i];
+    }
+    for (o = a->files; o; o = o->next) {
+	e = &cd[nentries++];
+	e->name = o->name;
+	e->replacement = o;
+	e->method = e->flags = 0;
+	e->time = dostime;
+	e->date = dosdate;
+    }
+
+    /* Write each file, preceded by its local file header. */
+    for (i = 0; i < nentries; i++) {
+	zip_u64 start, remaining;
+	unsigned int nlen = strlen(cd[i].name);
+	FILE *src;
+	int zip64;
+
+	e = &cd[i];
+	if (e->replacement) {
+	    /* Find the CRC and size of the new file. */
+	    src = e->replacement->tmp;
+	    if (fflush(src) != 0 || fseek(src, 0L, SEEK_SET) != 0)
+		goto ioerr;
+	    e->crc = 0;
+	    e->usize = 0;
+	    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+		e->crc = crc32_update(e->crc, (unsigned char *)buf, n);
+		e->usize += n;
+	    }
+	    if (ferror(src) || fseek(src, 0L, SEEK_SET) != 0)
+		goto ioerr;
+	    e->csize = e->usize;
+	    start = 0;
+	}
+	else {
+	    /* Copy a file from the existing archive as it is. */
+	    src = old;
+	    if (zip_data_offset(old, a->path, e, &start) < 0)
+		goto done;
+	    if (start > (zip_u64)LONG_MAX ||
+		fseek(old, (long)start, SEEK_SET) != 0)
+		goto ioerr;
+	    e->flags &= ~8U;	/* sizes are in the local header */
+	}
+	zip64 = (e->usize >= ZIP_LIMIT32 || e->csize >= ZIP_LIMIT32);
+	p = zput32(h, 0x04034b50UL);
+	p = zput16(p, zip64 ? 45 : 20);
+	p = zput16(p, e->flags);
+	p = zput16(p, e->method);
+	p = zput16(p, e->time);
+	p = zput16(p, e->date);
+	p = zput32(p, e->crc);
+	p = zput32(p, zip64 ? ZIP_LIMIT32 : (unsigned long)e->csize);
+	p = zput32(p, zip64 ? ZIP_LIMIT32 : (unsigned long)e->usize);
+	p = zput16(p, nlen);
+	p = zput16(p, zip64 ? 20 : 0);
+	if (zip64) {
+	    p = zput16(p, 0x0001);
+	    p = zput16(p, 16);
+	    p = zput64(p, e->usize);
+	    p = zput64(p, e->csize);
+	}
+	if (fwrite(h, 1, 30, f) != 30 ||
+	    fwrite(e->name, 1, nlen, f) != nlen ||
+	    (zip64 && fwrite(h + 30, 1, 20, f) != 20))
+	    goto ioerr;
+	e->offset = off;
+	off += 30 + nlen + (zip64 ? 20 : 0);
+	for (remaining = e->csize; remaining > 0; remaining -= n) {
+	    n = remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+	    if (fread(buf, 1, n, src) != n || fwrite(buf, 1, n, f) != n)
+		goto ioerr;
+	}
+	off += e->csize;
+    }
+
+    /* Write the central directory. */
+    cdoff = off;
+    for (i = 0; i < nentries; i++) {
+	unsigned int nlen = strlen(cd[i].name), xlen = 0;
+	unsigned char x[28], *q = x + 4;
+
+	e = &cd[i];
+	if (e->usize >= ZIP_LIMIT32) q = zput64(q, e->usize);
+	if (e->csize >= ZIP_LIMIT32) q = zput64(q, e->csize);
+	if (e->offset >= ZIP_LIMIT32) q = zput64(q, e->offset);
+	if (q > x + 4) {
+	    zput16(x, 0x0001);
+	    zput16(x + 2, (unsigned int)(q - x - 4));
+	    xlen = q - x;
+	}
+	p = zput32(h, 0x02014b50UL);
+	p = zput16(p, (3 << 8) | (xlen ? 45 : 20));	/* made by: Unix */
+	p = zput16(p, xlen ? 45 : 20);
+	p = zput16(p, e->flags);
+	p = zput16(p, e->method);
+	p = zput16(p, e->time);
+	p = zput16(p, e->date);
+	p = zput32(p, e->crc);
+	p = zput32(p, e->csize >= ZIP_LIMIT32 ? ZIP_LIMIT32 :
+		   (unsigned long)e->csize);
+	p = zput32(p, e->usize >= ZIP_LIMIT32 ? ZIP_LIMIT32 :
+		   (unsigned long)e->usize);
+	p = zput16(p, nlen);
+	p = zput16(p, xlen);
+	p = zput16(p, 0);			/* comment length */
+	p = zput16(p, 0);			/* disk number */
+	p = zput16(p, 0);			/* internal attributes */
+	p = zput32(p, 0100644UL << 16);		/* external attributes */
+	p = zput32(p, e->offset >= ZIP_LIMIT32 ? ZIP_LIMIT32 :
+		   (unsigned long)e->offset);
+	if (fwrite(h, 1, 46, f) != 46 || fwrite(e->name, 1, nlen, f) != nlen ||
+	    fwrite(x, 1, xlen, f) != xlen)
+	    goto ioerr;
+	cdsize += 46 + nlen + xlen;
+    }
+    off += cdsize;
+
+    /* Write the end of central directory record, preceded by ZIP64
+       records if needed. */
+    if (nentries >= ZIP_LIMIT16 || cdsize >= ZIP_LIMIT32 ||
+	cdoff >= ZIP_LIMIT32) {
+	p = zput32(h, 0x06064b50UL);
+	p = zput64(p, 44);
+	p = zput16(p, (3 << 8) | 45);
+	p = zput16(p, 45);
+	p = zput32(p, 0);
+	p = zput32(p, 0);
+	p = zput64(p, nentries);
+	p = zput64(p, nentries);
+	p = zput64(p, cdsize);
+	p = zput64(p, cdoff);
+	p = zput32(p, 0x07064b50UL);
+	p = zput32(p, 0);
+	p = zput64(p, off);
+	p = zput32(p, 1);
+	if (fwrite(h, 1, 76, f) != 76)
+	    goto ioerr;
+    }
+    p = zput32(h, 0x06054b50UL);
+    p = zput16(p, 0);
+    p = zput16(p, 0);
+    p = zput16(p, nentries >= ZIP_LIMIT16 ? ZIP_LIMIT16 : nentries);
+    p = zput16(p, nentries >= ZIP_LIMIT16 ? ZIP_LIMIT16 : nentries);
+    p = zput32(p, cdsize >= ZIP_LIMIT32 ? ZIP_LIMIT32 : (unsigned long)cdsize);
+    p = zput32(p, cdoff >= ZIP_LIMIT32 ? ZIP_LIMIT32 : (unsigned long)cdoff);
+    p = zput16(p, 0);
+    if (fwrite(h, 1, 22, f) != 22 || fflush(f) != 0 || ferror(f))
+	goto ioerr;
+    cstat = fclose(f);
+    f = NULL;
+    if (cstat != 0)
+	goto ioerr;
+    if (old) {
+	fclose(old);
+	old = NULL;
+    }
+
+    /* Give a replaced archive's permissions to the new one, then move the
+       new archive into place. */
+#if !defined(MSDOS) && !defined(_WIN32)
+    if (replacing && stat(a->path, &st) == 0)
+	(void)chmod(tmpname, st.st_mode & 07777);
+#endif
+    if (rename(tmpname, a->path) != 0) {
+#if defined(MSDOS) || defined(_WIN32)
+	/* rename doesn't replace an existing file on MS-Windows */
+	if (!replacing || remove(a->path) != 0 ||
+	    rename(tmpname, a->path) != 0)
+#endif
+	{
+	    wfdb_error("WFDB: can't create archive %s\n", a->path);
+	    goto done;
+	}
+    }
+    status = 0;
+    goto done;
+
+ ioerr:
+    wfdb_error("WFDB: error writing archive %s\n", a->path);
+ done:
+    if (f) fclose(f);
+    if (old) fclose(old);
+    if (status != 0 && tmpname) remove(tmpname);
+    SFREE(tmpname);
+    SFREE(cd);
+    free_zip_dir(&d);
+    return (status);
+}
+
+/* wfdb_archive_close_all writes all archives opened for output, and
+   releases the resources allocated for them.  It is invoked by wfdbquit,
+   and on exit.  It returns 0 if successful, or -1 if any archive could not
+   be written. */
+int wfdb_archive_close_all(void)
+{
+    struct archive_out *a;
+    int stat = 0;
+
+    while ((a = archive_out_list) != NULL) {
+	archive_out_list = a->next;
+	if (write_archive(a) < 0)
+	    stat = -1;
+	free_archive_out(a);
+    }
+    return (stat);
+}
+
 /* The definition of nf_vfprintf (which is a stub) has been moved;  it is
    now just before wfdb_fprintf, which refers to it.  There is no completely
    portable way to make a forward reference to a static (local) function. */
@@ -2084,14 +3191,19 @@ void wfdb_clearerr(WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	nf_clearerr(wp->netfp);
-    else
+    else {
+	if (wp->type == WFDB_ARCHIVE)
+	    wp->member->eof = wp->member->err = 0;
 	clearerr(wp->fp);
+    }
 }
 
 int wfdb_feof(WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_feof(wp->netfp));
+    if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (wp->member->eof);
     return (feof(wp->fp));
 }
 
@@ -2099,6 +3211,8 @@ int wfdb_ferror(WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_ferror(wp->netfp));
+    if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (wp->member->err || ferror(wp->fp));
     return (ferror(wp->fp));
 }
 
@@ -2110,6 +3224,8 @@ int wfdb_fflush(WFDB_FILE *wp)
     }
     else if (wp->type == WFDB_NET)
 	return (nf_fflush(wp->netfp));
+    else if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (0);
     else
 	return (fflush(wp->fp));
 }
@@ -2118,6 +3234,8 @@ char* wfdb_fgets(char *s, int size, WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_fgets(s, size, wp->netfp));
+    if (wp->type == WFDB_ARCHIVE)
+	return (am_fgets(s, size, wp));
     return (fgets(s, size, wp->fp));
 }
 
@@ -2125,6 +3243,8 @@ size_t wfdb_fread(void *ptr, size_t size, size_t nmemb, WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_fread(ptr, size, nmemb, wp->netfp));
+    if (wp->type == WFDB_ARCHIVE)
+	return (am_fread(ptr, size, nmemb, wp));
     return (fread(ptr, size, nmemb, wp->fp));
 }
 
@@ -2132,6 +3252,8 @@ int wfdb_fseek(WFDB_FILE *wp, long int offset, int whence)
 {
     if (wp->type == WFDB_NET)
 	return (nf_fseek(wp->netfp, offset, whence));
+    if (wp->type == WFDB_ARCHIVE)
+	return (am_fseek(wp, offset, whence));
     return(fseek(wp->fp, offset, whence));
 }
 
@@ -2139,6 +3261,8 @@ long wfdb_ftell(WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_ftell(wp->netfp));
+    if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (wp->member->pos);
     return (ftell(wp->fp));
 }
 
@@ -2146,6 +3270,8 @@ size_t wfdb_fwrite(const void *ptr, size_t size, size_t nmemb, WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_fwrite(ptr, size, nmemb, wp->netfp));
+    if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (0);		/* opened for reading only */
     return (fwrite(ptr, size, nmemb, wp->fp));
 }
 
@@ -2153,6 +3279,8 @@ int wfdb_getc(WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_fgetc(wp->netfp));
+    if (wp->type == WFDB_ARCHIVE)
+	return (am_getc(wp));
     return (getc(wp->fp));
 }
 
@@ -2160,6 +3288,8 @@ int wfdb_putc(int c, WFDB_FILE *wp)
 {
     if (wp->type == WFDB_NET)
 	return (nf_putc(c, wp->netfp));
+    if (wp->type == WFDB_ARCHIVE && !wp->member->out)
+	return (EOF);		/* opened for reading only */
     return (putc(c, wp->fp));
 }
 
@@ -2167,6 +3297,22 @@ int wfdb_fclose(WFDB_FILE *wp)
 {
     int status;
 
+    if (wp->type == WFDB_ARCHIVE) {
+	struct wfdb_member *m = wp->member;
+
+	if (m->out) {	/* the file is written when the archive is closed */
+	    status = fflush(wp->fp);
+	    if (ferror(wp->fp)) status = EOF;
+	    m->out->open = 0;
+	}
+	else
+	    status = fclose(wp->fp);
+	SFREE(m->archive);
+	SFREE(m->name);
+	SFREE(m);
+	SFREE(wp);
+	return (status);
+    }
 #if WFDB_NETFILES
     status = (wp->type == WFDB_NET) ? nf_fclose(wp->netfp) : fclose(wp->fp);
 #else
@@ -2179,11 +3325,25 @@ int wfdb_fclose(WFDB_FILE *wp)
 
 WFDB_FILE *wfdb_fopen(char *fname, const char *mode)
 {
-    char *p = fname;
+    char *p = fname, *archive, *member;
     WFDB_FILE *wp;
 
     if (p == NULL || strstr(p, ".."))
 	return (NULL);
+
+    /* Check for a file within an archive (see wfdb_archive_split). */
+    if (wfdb_archive_split(fname, &archive, &member)) {
+	if (strstr(archive, "://"))
+	    wp = NULL;	/* remote archives are not supported */
+	else if (*mode == 'r')
+	    wp = open_member(archive, member);
+	else
+	    wp = open_output_member(archive, member, mode);
+	SFREE(archive);
+	SFREE(member);
+	return (wp);
+    }
+
     SUALLOC(wp, 1, sizeof(WFDB_FILE));
     if (strstr(p, "://")) {
 #if WFDB_NETFILES
@@ -2200,33 +3360,39 @@ WFDB_FILE *wfdb_fopen(char *fname, const char *mode)
 	return (wp);
     }
     if (strcmp(mode, WB) == 0 || strcmp(mode, AB) == 0) {
-        int stat = 1;
-
 	/* An attempt to create an output file failed.  Check to see if all
 	   of the directories in the path exist, create them if necessary
 	   and possible, then try again. */
-        for (p = fname; *p; p++)
-	    if (*p == '/') {	/* only Unix-style directory separators */
-		*p = '\0';
-		stat = MKDIR(fname, 0755);
-		/* MKDIR is defined as mkdir in wfdblib.h;  depending on
-		   the platform, mkdir may take two arguments (POSIX), or
-		   only the first argument (MS-Windows without Cygwin).
-		   The '0755' means that (under Unix), the directory will
-		   be world-readable, but writable only by the owner. */
-		*p = '/';
-	    }
-	/* At this point, we may have created one or more directories.
-	   Only the last attempt to do so matters here:  if and only if
-	   it was successful (i.e., if stat is now 0), we should try again
-	   to create the output file. */
-	if (stat == 0 && (wp->fp = fopen(fname, mode))) {
+	if (archive_mkdirs(fname) == 0 && (wp->fp = fopen(fname, mode))) {
 		wp->type = WFDB_LOCAL;
 		return (wp);
 	}
     }
     SFREE(wp);
     return (NULL);
+}
+
+/* archive_mkdirs creates any missing directories in the path fname.  Only
+   the last attempt to create a directory matters:  it returns 0 if and only
+   if that attempt was successful, in which case the caller should try again
+   to create the output file. */
+static int archive_mkdirs(char *fname)
+{
+    char *p;
+    int stat = 1;
+
+    for (p = fname; *p; p++)
+	if (*p == '/') {	/* only Unix-style directory separators */
+	    *p = '\0';
+	    stat = MKDIR(fname, 0755);
+	    /* MKDIR is defined as mkdir in wfdblib.h;  depending on
+	       the platform, mkdir may take two arguments (POSIX), or
+	       only the first argument (MS-Windows without Cygwin).
+	       The '0755' means that (under Unix), the directory will
+	       be world-readable, but writable only by the owner. */
+	    *p = '/';
+	}
+    return (stat);
 }
 
 /* Miscellaneous OS-specific functions. */
