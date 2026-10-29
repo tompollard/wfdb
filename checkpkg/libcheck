@@ -1,6 +1,6 @@
 #!/bin/sh
 # file: libcheck		G. Moody       8 September 2001
-#                               Last revised:     18 May 2022
+#                               Last revised:  29 October 2026
 #
 # This script checks the functionality of the WFDB library by comparing the
 # outputs of 'lcheck' with expected outputs.  See 'lcheck.c' for details of
@@ -115,7 +115,7 @@ do
     TESTS=`expr $TESTS + 1`
 done
 
-rm -rf data 100y.*
+rm -rf data 100y.* 100x.wfdb
 
 if [ $PASS = $TESTS ]
 then

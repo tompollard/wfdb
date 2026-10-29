@@ -1,6 +1,6 @@
 #!/bin/sh
 # file: appcheck		G. Moody       7 September 2001
-#                               Last revised:     18 May 2022
+#                               Last revised:  29 October 2026
 #
 # This script checks the basic functionality of most of the WFDB applications
 # in the 'app' directory.  These programs are not (yet) tested by this script:
@@ -525,6 +525,40 @@ do
   fi
   TESTS=`expr $TESTS + 1`
 done
+
+echo Testing archives ...
+# Copy record 100s and its annotations into an archive, add annotations
+# made by sqrs to the archive, and check that the record and both sets of
+# annotations can be read from the archive.
+rm -f 100a.wfdb
+$BINDIR/xform$exe -i 100s -a atr -n 100a.wfdb </dev/null >/dev/null 2>&1
+$BINDIR/sqrs$exe -r 100a.wfdb 2>sqrs.log
+$BINDIR/rdsamp$exe -r 100a.wfdb -f 10 -t 11 -p -v >rdsamp.out
+$BINDIR/rdann$exe -r 100a.wfdb -a atr >rdann.out
+$BINDIR/rdann$exe -r 100a.wfdb -a qrs >archive-qrs.out
+cp expected/100s.qrs .
+$BINDIR/rdann$exe -r 100s -a qrs >100s-qrs.out
+for F in rdsamp.out rdann.out
+do
+  if ( ./checkfile $F )
+  then
+    PASS=`expr $PASS + 1`
+    rm -f $F
+  else
+    FAIL=`expr $FAIL + 1`
+  fi
+  TESTS=`expr $TESTS + 1`
+done
+if [ -s archive-qrs.out ] && ( cmp archive-qrs.out 100s-qrs.out >/dev/null )
+then
+  PASS=`expr $PASS + 1`
+  rm -f archive-qrs.out 100s-qrs.out sqrs.log 100a.wfdb
+else
+  echo " Annotations in 100a.wfdb and 100s.qrs differ: test failed"
+  FAIL=`expr $FAIL + 1`
+fi
+rm -f 100s.qrs
+TESTS=`expr $TESTS + 1`
 
 if ( grep "WFDB_NETFILES 1" $INCDIR/wfdb/wfdb.h >grep.out 2>&1 )
 then

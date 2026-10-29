@@ -1,5 +1,5 @@
 /* file: lcheck.c	G. Moody       7 September 2001
-			Last revised:  18 May 2022
+			Last revised:  29 October 2026
 -------------------------------------------------------------------------------
 wfdbcheck: test WFDB library
 Copyright (C) 2001-2010 George B. Moody
@@ -175,14 +175,15 @@ char *argv[];
     printf("[OK]:  newcal was successful\n");
 
   /* Test I/O using the local record first, converting signals to
-     another format and back. */
+     another format and back, by way of a record in an archive. */
   check_annotations("100s");
 #ifdef WFDB_FLAC_SUPPORT
   check_signals("100s", "100y", 516, 1);
 #else
   check_signals("100s", "100y", 16, 1);
 #endif
-  check_signals("100y", "100z", 212, 0);
+  check_signals("100y", "100x.wfdb", 212, 1);
+  check_signals("100x.wfdb", "100z", 212, 0);
 
   /* Test I/O again using the remote record. */
   if (WFDB_NETFILES) {
